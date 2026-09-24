@@ -493,14 +493,53 @@ function rasterizeSvg(svgText) {
   });
 }
 
+/* ------------------------------------------------------------ libraries: local first, CDN fallback */
+const CDN = {
+  jspdf: "https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js",
+  qrcode: "https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js",
+  pdfjs: "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js",
+  pdfworker: "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js"
+};
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    const sc = document.createElement("script");
+    sc.src = src; sc.onload = res; sc.onerror = () => rej(new Error("не загрузилась библиотека " + src));
+    document.head.appendChild(sc);
+  });
+}
+let libsPromise = null;
+function ensureLibs() {
+  if (!libsPromise) libsPromise = (async () => {
+    if (!window.jspdf) await loadScript(CDN.jspdf);
+    if (typeof qrcode === "undefined") await loadScript(CDN.qrcode);
+    if (typeof pdfjsLib === "undefined") { await loadScript(CDN.pdfjs); await loadScript(CDN.pdfworker); }
+    else if (!window.pdfjsWorker) await loadScript(CDN.pdfworker);
+  })();
+  return libsPromise;
+}
+
 /* ------------------------------------------------------------ fonts for the PDF */
 let fontData = null;
 async function loadFonts() {
   if (fontData) return fontData;
-  const names = { InterR: "fonts/Inter-Regular.ttf", InterM: "fonts/Inter-Medium.ttf", InterSB: "fonts/Inter-SemiBold.ttf" };
+  const names = {
+    InterR: ["fonts/Inter-Regular.ttf", "https://cdn.jsdelivr.net/npm/@expo-google-fonts/inter@0.4.2/400Regular/Inter_400Regular.ttf"],
+    InterM: ["fonts/Inter-Medium.ttf", "https://cdn.jsdelivr.net/npm/@expo-google-fonts/inter@0.4.2/500Medium/Inter_500Medium.ttf"],
+    InterSB: ["fonts/Inter-SemiBold.ttf", "https://cdn.jsdelivr.net/npm/@expo-google-fonts/inter@0.4.2/600SemiBold/Inter_600SemiBold.ttf"]
+  };
   const out = {};
-  for (const [k, url] of Object.entries(names)) {
-    const buf = await (await fetch(url)).arrayBuffer();
+  for (const [k, urls] of Object.entries(names)) {
+    let buf = null;
+    for (const url of urls) {
+      try {
+        const r = await fetch(url);
+        if (!r.ok) continue;
+        const b = await r.arrayBuffer();
+        const sig = new Uint8Array(b.slice(0, 4));
+        if (b.byteLength > 10000 && sig[0] === 0 && sig[1] === 1) { buf = b; break; } // настоящий TTF
+      } catch (e) {}
+    }
+    if (!buf) throw new Error("не загрузился шрифт для PDF");
     const bytes = new Uint8Array(buf);
     let bin = "";
     for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
@@ -521,9 +560,12 @@ const TOP_Y = 14, LOGO_TOP = 9, ROW_STEP = 4.6;
 const FRAME_FIRST = 52, FRAME_NEXT = 30, FRAME_BOTTOM = H - 38;
 const COLS = ["ID", "STRUMENTO", "TIPO", "CAPITALE (EUR)", "LEVA", "APERTURA (UTC)", "CHIUSURA (UTC)", "PROFITTO / PERDITA"];
 const COL_W = [28, 30, 22, 32, 20, 40, 34, 34];
-const ROW_H = 7.4, HEAD_H = 7, TOTAL_H = 10, PAD = 7 * PT, TITLE_H = 14.4 * PT + 3;
+const SUM_GAP = 2.5, SUM_ROW_H = 6.2;
+const ROW_H = 7.4, HEAD_H = 7, TOTAL_H = 10, SUMMARY_H = 2.5 + 2 * 6.2 + 10, PAD = 7 * PT, TITLE_H = 14.4 * PT + 3;
 
 async function buildPdf(data) {
+  await ensureLibs();
+  if (!data.qr) data.qr = makeQR(siteUrl(S.coSite));
   const { jsPDF } = window.jspdf;
   const fonts = await loadFonts();
   const doc = new jsPDF({ orientation: "landscape", unit: "mm", format: "a4", compress: true });
@@ -659,12 +701,35 @@ async function buildPdf(data) {
     f("InterSB", 11.5, total > 0 ? C.GREEN : total < 0 ? C.RED : C.BLACK);
     doc.text(fmtEur(total, true, " EUR"), colX[7] + colWmm[7] - PAD, b, { align: "right" });
   }
+  // итоги: прибыль, убыток, чистый результат (считаются по значениям, видимым в строках)
+  function summaryBlock(labels, trades, y) {
+    const cents = trades.map((t) => Math.round(t.pnl * 100));
+    const plus = cents.filter((c) => c > 0), minus = cents.filter((c) => c < 0);
+    const sum = (a) => a.reduce((x, c) => x + c, 0) / 100;
+    const ops = (n) => n + (n === 1 ? " operazione" : " operazioni");
+    const valX = colX[7] + colWmm[7] - PAD;
+    const line = (label, count, v, color, yy) => {
+      const b = yy + SUM_ROW_H / 2 + 8.5 * PT * 0.36;
+      f("InterR", 8.5, C.SOFT); doc.text(label, MX + PAD, b);
+      const lw = doc.getTextWidth(label);
+      f("InterR", 8, C.GRAY); doc.text("  ·  " + ops(count), MX + PAD + lw, b);
+      f("InterM", 9, color); doc.text(fmtEur(v, true, " EUR"), valX, b, { align: "right" });
+    };
+    y += SUM_GAP;
+    line(labels.plus, plus.length, sum(plus), plus.length ? C.GREEN : C.BLACK, y); y += SUM_ROW_H;
+    line(labels.minus, minus.length, sum(minus), minus.length ? C.RED : C.BLACK, y); y += SUM_ROW_H;
+    doc.setDrawColor(C.LINE); doc.setLineWidth(0.5 * PT);
+    doc.line(MX, y + 0.8, RIGHT, y + 0.8);
+    totalRow(labels.total, sum(cents), y);
+  }
 
   /* --- flow --- */
   let y = FRAME_FIRST;
   const newPage = () => { doc.addPage("a4", "landscape"); y = FRAME_NEXT; };
   const title = mode === "aperte" ? "Operazioni aperte" : "Operazioni chiuse nel periodo";
-  const totalLabel = mode === "aperte" ? "Totale non realizzato" : "Totale realizzato";
+  const labels = mode === "aperte"
+    ? { plus: "Profitti non realizzati", minus: "Perdite non realizzate", total: "Totale non realizzato" }
+    : { plus: "Profitti realizzati", minus: "Perdite realizzate", total: "Totale realizzato" };
 
   if (trades.length && y + TITLE_H + HEAD_H + 3 * ROW_H > FRAME_BOTTOM) newPage();
   f("InterSB", 12, C.BLUE);
@@ -677,12 +742,11 @@ async function buildPdf(data) {
     tableHeader(y); y += HEAD_H;
     const n = trades.length, keepFrom = Math.max(0, n - 2);
     trades.forEach((t, i) => {
-      const need = i === keepFrom ? (n - i) * ROW_H + TOTAL_H : ROW_H;
+      const need = i === keepFrom ? (n - i) * ROW_H + SUMMARY_H : ROW_H;
       if (y + need > FRAME_BOTTOM) { newPage(); tableHeader(y); y += HEAD_H; }
       tableRow(t, i, y); y += ROW_H;
     });
-    const total = trades.reduce((a, t) => a + t.pnl, 0);
-    totalRow(totalLabel, total, y);
+    summaryBlock(labels, trades, y);
   }
 
   /* --- headers & footers on every page --- */
@@ -966,7 +1030,7 @@ function renderParsed() {
   const chip = (cls, txt) => { const s = document.createElement("span"); s.className = "chip " + cls; s.textContent = txt; st.appendChild(s); };
   chip("ok", `Распознано: ${ok.length}`);
   if (bad.length) chip("err", `С ошибкой: ${bad.length}`);
-  const sum = (arr) => arr.reduce((a, r) => a + r.t.pnl, 0);
+  const sum = (arr) => arr.reduce((a, r) => a + Math.round(r.t.pnl * 100), 0) / 100;
   const openRows = ok.filter((r) => !r.t.close), closedRows = ok.filter((r) => r.t.close);
   const tot = (label, arr) => {
     if (!arr.length) return;
@@ -975,8 +1039,10 @@ function renderParsed() {
     c.innerHTML = `${label}: <b class="${v > 0 ? "pos" : v < 0 ? "neg" : ""}">${fmtEur(v, true, " EUR")}</b>`;
     st.appendChild(c);
   };
-  tot("Totale non realizzato", openRows);
-  tot("Totale realizzato", closedRows);
+  const rowsNow = S.mode === "aperte" ? openRows : closedRows;
+  tot("Прибыль", rowsNow.filter((r) => Math.round(r.t.pnl * 100) > 0));
+  tot("Убыток", rowsNow.filter((r) => Math.round(r.t.pnl * 100) < 0));
+  tot(S.mode === "aperte" ? "Итого (non realizzato)" : "Итого (realizzato)", rowsNow);
   // имя клиента из колонки User
   const users = [...new Set(ok.map((r) => r.t.user).filter(Boolean))];
   if (users.length === 1 && users[0] !== (S.clientName || "").trim()) {
@@ -1063,6 +1129,7 @@ function plural(n, one, few, many) {
 }
 async function renderPreview(bytes, seq) {
   const stage = $("stage");
+  try { await ensureLibs(); } catch (e) {}
   if (typeof pdfjsLib === "undefined") { stage.innerHTML = `<div class="msg">Предпросмотр недоступен, но PDF можно скачать.</div>`; return; }
   const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(bytes.slice(0)) }).promise;
   if (seq !== buildSeq) return;
@@ -1129,6 +1196,7 @@ window.addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() =
     catch (e) { logoPng = null; }
   } else mountLogo();
   setMode(S.mode === "chiuse" ? "chiuse" : "aperte");
+  ensureLibs().then(renderQR).catch(() => {});
 })();
 
 })();
